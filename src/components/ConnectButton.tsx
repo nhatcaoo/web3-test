@@ -14,22 +14,56 @@ import {
   ModalFooter,
   ModalBody,
   ModalCloseButton,
+  Table,
+  Thead,
+  Tbody,
+  Tr,
+  Th,
+  Link,
+  Td,
 } from "@chakra-ui/react";
 import { useDisclosure, useToast } from "@chakra-ui/react";
 import { injected } from "../config/wallets";
 import abi from "./abi.json";
 import { AbiItem } from "web3-utils";
-
 declare global {
   interface Window {
     ethereum: any;
   }
 }
+export function useLocalStorage<T>(key: string, initialValue: T) {
+  const [storedValue, setStoredValue] = useState<T>(() => {
+    try {
+      const item = window.localStorage.getItem(key);
+      return item ? JSON.parse(item) : initialValue;
+    } catch (error) {
+      console.error(error);
+      return initialValue;
+    }
+  });
+
+  const setValue = (value: T | ((val: T) => T)) => {
+    try {
+      const valueToStore =
+        value instanceof Function ? value(storedValue) : value;
+      setStoredValue(valueToStore);
+      window.localStorage.setItem(key, JSON.stringify(valueToStore));
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
+  return [storedValue, setValue] as const;
+}
 
 export default function ConnectButton() {
   const { account, active, activate, library, deactivate } = useWeb3React();
   const { isOpen, onOpen, onClose } = useDisclosure();
-  const [connected, setConnected] = useState<boolean>(false);
+  const [connected, setConnected] = useLocalStorage<boolean>(
+    "connected",
+    false
+  );
+  const [loading, setLoading] = useState(false);
   const [balance, setBalance] = useState<string>("0");
   const [babyBalance, setBabyBalance] = useState<string>("0");
   const [mode, setMode] = useState<string>("BNB");
@@ -38,9 +72,37 @@ export default function ConnectButton() {
   const [gasFee, setGasFee] = useState<string>("");
   const [gasLimit, setGasLimit] = useState<number>(0);
   const toast = useToast();
-
+  const [transactions, setTransactions] = useState<any[]>([]);
+  const apiHost = "http://localhost:4000/api/v1";
+  const fetchTransactions = useCallback(async () => {
+    try {
+      // Fetch the transactions data from the server
+      const response = await fetch(`${apiHost}/transactions`);
+      if (!response.ok) {
+        throw new Error("Network response was not ok");
+      }
+      const data = await response.json();
+      // Sort the transactions in descending order based on the createdAt field
+      const sortedTransactions = data.transactions.sort((a: any, b: any) => {
+        const timestampA = Date.parse(a.createdAt);
+        const timestampB = Date.parse(b.createdAt);
+        return timestampB - timestampA;
+      });
+      setTransactions(sortedTransactions);
+    } catch (error) {
+      console.error("Error fetching transactions:", error);
+    }
+  }, []);
+  // Function to update the account value in local storage
+  // const updateLocalStorageAccount = (accountValue: string | null) => {
+  //   setAccount(accountValue);
+  // };
   function handleConnectWallet() {
     connected ? deactivate() : activate(injected);
+    console.log(
+      "🚀 ~ file: ConnectButton.tsx:97 ~ handleConnectWallet ~ connected:",
+      connected
+    );
     setConnected(!connected);
   }
 
@@ -80,44 +142,73 @@ export default function ConnectButton() {
     onOpen();
   }
 
-  const sendBaby = useCallback(async () => {
-    const web3 = new Web3(library.provider);
-    const ctx = new web3.eth.Contract(
-      abi as AbiItem[],
-      "0xc748673057861a797275CD8A068AbB95A902e8de"
-    );
-
-    await ctx.methods.approve(account, sendAmount).call();
-    await ctx.methods.transfer(recieverAdd, sendAmount).send();
-  }, [account, library]);
-
   const sendAction = useCallback(async () => {
+    setLoading(true); // Start loading
+    let scaledAmount;
     const web3 = new Web3(library.provider);
+    let txHash = "";
 
-    const txParams: any = {
-      from: account,
-      to: recieverAdd,
+    try {
+      if (mode === "BabyDoge") {
+        // If the modal is open, send BabyDoge
+        const ctx = new web3.eth.Contract(
+          abi as AbiItem[],
+          "0x28017936e4e95ccafe2d3d89c222bf470e58965e"
+        );
 
-      value: Web3.utils.toWei(sendAmount.toString(), "ether"),
-    };
-    console.log(txParams);
-    await web3.eth.sendTransaction(txParams, (error: any, hash: any) => {
-      if (error) {
-        console.error(error);
+        scaledAmount = Web3.utils.toWei(sendAmount.toString(), "gwei");
+        const transferTx = await ctx.methods
+          .transfer(recieverAdd, scaledAmount)
+          .send({ from: account });
+        txHash = transferTx.transactionHash;
       } else {
-        console.log(`Transaction hash: ${hash}`);
-        web3.eth.getTransaction(hash, (error, transaction) => {
-          if (error) {
-            return;
-          }
+        scaledAmount = Web3.utils.toWei(sendAmount.toString(), "ether");
+        // If the modal is closed, send Ether
+        const txParams: any = {
+          from: account,
+          to: recieverAdd,
+          value: scaledAmount,
+        };
 
-          console.log(`Transaction data: ${transaction?.input}`);
-        });
+        const sendTx = await web3.eth.sendTransaction(txParams);
+        txHash = sendTx.transactionHash;
       }
-    });
-    onClose();
-    valueload();
-  }, [account, library, recieverAdd, sendAmount]);
+
+      onClose();
+
+      const formData = {
+        sender: account ?? "",
+        receiver: recieverAdd,
+        token: mode,
+        transactionHash: txHash,
+        amount: scaledAmount,
+      };
+
+      // Send the transaction data to the server
+      const response = await fetch(`${apiHost}/transaction/new`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(formData),
+      });
+
+      if (!response.ok) {
+        throw new Error("Network response was not ok");
+      }
+
+      const data = await response.json();
+      console.log("Response from server:", data);
+
+      valueload();
+      fetchTransactions();
+    } catch (error) {
+      console.error("Error:", error);
+      // Handle any errors that occurred during the transaction or API call
+    } finally {
+      setLoading(false); // Stop loading
+    }
+  }, [account, library, isOpen, recieverAdd, sendAmount]);
 
   function fromWei(
     web3: { utils: { fromWei: (arg0: any) => any } },
@@ -143,9 +234,8 @@ export default function ConnectButton() {
     const web3 = new Web3(library.provider);
     const ctx = new web3.eth.Contract(
       abi as AbiItem[],
-      "0xc748673057861a797275CD8A068AbB95A902e8de"
+      "0x28017936e4e95ccafe2d3d89c222bf470e58965e"
     );
-    console.log(ctx);
     if (account) {
       const value = await web3.eth.getBalance(account);
       setBalance(Number(fromWei(web3, value)).toFixed(5));
@@ -153,19 +243,73 @@ export default function ConnectButton() {
       const gasPrice = await web3.eth.getGasPrice();
       setGasFee(gasPrice);
 
-      // const value1 = await ctx.methods.balanceOf(account).call({gasPrice: Number(gasPrice) * 100});
-      // console.log('[baby amount]', value1)
-      // setBabyBalance(value1);
+      const value1 = await ctx.methods
+        .balanceOf(account)
+        .call({ gasPrice: Number(gasPrice) * 100 });
+      console.log("[baby amount]", value1);
+      setBabyBalance(value1);
     }
   }, [account, library]);
+  function formatDate(createdAt: string) {
+    try {
+      const date = new Date(createdAt);
+      const options: Intl.DateTimeFormatOptions = {
+        month: "short",
+        day: "2-digit",
+        hour: "numeric",
+        minute: "numeric",
+        hour12: true,
+        timeZoneName: "short", // This will show the timezone abbreviation (e.g., EDT, PDT)
+      };
 
+      return date.toLocaleString("en-US", options);
+    } catch (error) {
+      console.error("Error parsing date:", error);
+      return "Invalid date";
+    }
+  }
+  function shortenAddress(address: string, digits = 4) {
+    return `${address.substring(0, digits + 2)}...${address.substring(
+      address.length - digits
+    )}`;
+  }
+
+  function shortenHash(hash: string, digits = 6) {
+    return `${hash.substring(0, digits + 2)}...${hash.substring(
+      hash.length - digits
+    )}`;
+  }
+  function convertAmount(amount: number, token: string): string {
+    const web3 = new Web3();
+
+    // Convert amount to a valid number
+    const parsedAmount =
+      typeof amount === "string" ? parseFloat(amount) : amount;
+
+    if (isNaN(parsedAmount)) {
+      // Return a default value if the amount is not a valid number
+      return "NaN";
+    }
+    if (token === "BNB") {
+      return web3.utils.fromWei(parsedAmount.toString(), "ether");
+    } else if (token === "BabyDoge") {
+      return web3.utils.fromWei(parsedAmount.toString(), "gwei");
+    } else {
+      return amount.toString();
+    }
+  }
   useEffect(() => {
-    active && valueload();
-  }, [account, active, valueload]);
+    if (!active && connected) {
+      activate(injected);
+    } else {
+      valueload();
+      fetchTransactions();
+    }
+  }, [account, active, valueload, fetchTransactions, connected]);
 
   return (
     <>
-    <h1 className="title">Metamask login demo from Enva Division</h1>
+      <h1 className="title">Metamask login demo from Enva Division</h1>
       {account ? (
         <Box
           display="block"
@@ -226,7 +370,12 @@ export default function ConnectButton() {
             <Text color="#158DE8" fontWeight="medium">
               BNB / BabyDoge
             </Text>
-            <Switch size="md" value={mode} onChange={handleMode} />
+            <Switch
+              size="md"
+              value={mode}
+              isChecked={mode === "BabyDoge"}
+              onChange={handleMode}
+            />
           </Box>
           <Box
             display="block"
@@ -308,7 +457,11 @@ export default function ConnectButton() {
                 <Button colorScheme="blue" mr={3} onClick={onClose}>
                   Close
                 </Button>
-                <Button variant="ghost" onClick={sendAction}>
+                <Button
+                  variant="ghost"
+                  isLoading={loading}
+                  onClick={sendAction}
+                >
                   Send
                 </Button>
               </ModalFooter>
@@ -338,6 +491,69 @@ export default function ConnectButton() {
           </Button>
         </Box>
       )}
+      <Box
+        bg="white"
+        p="4"
+        borderRadius="xl"
+        mt="4"
+        overflowY="auto"
+        maxHeight="400px"
+      >
+        <Text fontWeight="medium" fontSize="xl" mb="4">
+          Transactions:
+        </Text>
+        {account ? (
+          <Table variant="simple">
+            <Thead>
+              <Tr>
+                <Th>Token</Th>
+                <Th>Sender</Th>
+                <Th>Receiver</Th>
+                <Th>Amount</Th>
+                <Th>Transaction Hash</Th>
+                <Th>Created At</Th>
+              </Tr>
+            </Thead>
+            <Tbody>
+              {transactions.map((tx) => (
+                <Tr key={tx.transactionHash}>
+                  <Td>{tx.token}</Td>
+                  <Td>
+                    <Link
+                      href={`https://testnet.bscscan.com/address/${tx.sender}`}
+                      isExternal
+                      color="blue.500"
+                    >
+                      {shortenAddress(tx.sender)}
+                    </Link>
+                  </Td>
+                  <Td>
+                    <Link
+                      href={`https://testnet.bscscan.com/address/${tx.receiver}`}
+                      isExternal
+                      color="blue.500"
+                    >
+                      {shortenAddress(tx.receiver)}
+                    </Link>
+                  </Td>
+                  <Td>{convertAmount(tx.amount, tx.token)}</Td>
+                  <Td>
+                    <Link
+                      href={`https://testnet.bscscan.com/tx/${tx.transactionHash}`}
+                      isExternal
+                      color="blue.500"
+                    >
+                      {shortenHash(tx.transactionHash)}
+                    </Link>
+                  </Td>
+                  <Td>{formatDate(tx.createdAt)}</Td>
+                </Tr>
+              ))}
+            </Tbody>
+          </Table>
+        ) : null}
+      </Box>
+      ;
     </>
   );
 }
